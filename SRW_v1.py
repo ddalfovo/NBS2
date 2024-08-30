@@ -37,11 +37,18 @@
 ####################################################################################################
 import os
 import pandas as pd
-import numpy as np
+# import numpy as np
 import functools
 import time
 
 import torch
+
+if torch.cuda.is_available():
+    device = torch.device('cuda')
+elif torch.backends.mps.is_available():
+    device = torch.device('mps')
+else:
+    device = torch.device('cpu')
 ####################################################################################################
 # The following functions load a network, samples, and group labels from files
 ####################################################################################################
@@ -83,8 +90,8 @@ def load_network(file_name, output_dir='', add_selfloop=True):
         with open("{}/index_nodes".format(output_dir), 'w') as outfile:
             outfile.write( "\n".join(index_map) )
             
-    edges = torch.tensor((df.iloc[:,:2].applymap(lambda x: node2index[x]).values))
-    features = torch.tensor(df.iloc[:,2:].values)
+    edges = torch.tensor((df.iloc[:,:2].map(lambda x: node2index[x]).values)).to(device)
+    features = torch.tensor(df.iloc[:,2:].values).to(torch.float32).to(device)
     return edges, features, nodes
 
 
@@ -113,7 +120,7 @@ def load_samples(file_name, nodes, output_dir=''):
     # P_init.update(df)
     # P_init = P_init.fillna(0).values
     # P_init = torch.tensor(P_init).to_sparse_coo()
-    P_init = torch.tensor(df[list(node_set)].fillna(0).values).to_sparse_coo()
+    P_init = torch.tensor(df[list(node_set)].fillna(0).values).to(device).to_sparse_coo()
     return P_init, samples
 
 
@@ -128,28 +135,9 @@ def load_grouplabels(file_name):
 
 
 
-def renorm_neg(M):
-    M_sum = (abs(M).sum(axis=1))
-    M_norm = (abs(M) / (M_sum+1e-8))
-    return csr_matrix(M_norm).multiply(M.sign())
-
-def iterative_PPR(Q, P_init, rst_prob):
-
-    # Q and P_init are already normalized by row sums
-    # Takes P_init and a transition matrix to find the PageRank of nodes
-    P = P_init.copy()
-    rst_prob_P_init = rst_prob*P_init
-    P_new =  (1-rst_prob)*np.dot(P, Q) + rst_prob_P_init
-    while not(jit_allclose(P, P_new)):
-        P = P_new
-        P_new =  (1-rst_prob)*np.dot(P, Q) + rst_prob_P_init
-
-    # term1 = (1-rst_prob)*P_init
-    # term2 = np.identity(P_init.shape[1])-rst_prob*Q
-    # term2_inv = np.linalg.inv(term2)
-    # P_new = np.dot(term1, term2_inv)
-    return P_new
-
+def allclose(a, b, rtol=1e-5, atol = 1e-8):
+    c = abs(a-b) - rtol*abs(b)
+    return (c.max() <= atol).item()
 
 ####################################################################################################
 # The following functions calculate the gradients of the transition matrix Q and PageRank scores P
@@ -157,25 +145,25 @@ def iterative_PPR(Q, P_init, rst_prob):
 
 # Return the edge strength (e by 1) calculated by a logistic function
 # Inputs: edge features (e by w) and edge feature weights (vector w)
-def logistic_edge_strength_cuda(features, w):
+def logistic_edge_strength(features, w):
     return  1.0 / (1+torch.exp(-features.mv(w)))
 
 
 # Calculate the gradient of edge strength functioin with
 # respect to edge feature weights, returns a matrix of gradients (e by w)
 # Equation: dStrength/dw = features * edge_strength * (1-edge_strength)
-def logistic_strength_gradient_cuda(features, edge_strength):
-    logistic_slop = torch.multiply(edge_strength, (1-edge_strength))[:,np.newaxis]
+def logistic_strength_gradient(features, edge_strength):
+    logistic_slop = torch.multiply(edge_strength, (1-edge_strength)).unsqueeze(-1)
     return features.multiply(logistic_slop)
 
 
 # Normalize a matrix by row sums,
 # return a normalized matrix
-def renorm_neg_cuda(M):
+def renorm_neg(M):
     M = M.to_dense()
     M_sum = abs(M).sum(dim=1,keepdim=True)
     M_norm = torch.div(M,(M_sum + 1e-8))
-    return M_norm.to_sparse_csr().to(torch.float64)
+    return M_norm.to_sparse_csr()
 
 # This function takes edges (e by 2), edge features (e by w), 
 # edge feature weights (vector w), and the number of nodes,
@@ -183,19 +171,19 @@ def renorm_neg_cuda(M):
 # transition matrix M_strength (n by n), row sums of M_strength (n by 1), 
 # and the gradient of edge strength (e by w)
 # Note: (i, j) and (j, i) should be 2 rows in edges, with different features
-def strength_Q_and_gradient_cuda(edges, nnodes, features, w):
+def strength_Q_and_gradient(edges, nnodes, features, w):
     # Calculate edge strength and the gradient of strength
-    edge_strength = logistic_edge_strength_cuda(features, w)
-    strength_grad = logistic_strength_gradient_cuda(features, edge_strength)
+    edge_strength = logistic_edge_strength(features, w)
+    strength_grad = logistic_strength_gradient(features, edge_strength)
     # M_strength (n by n) is a matrix containing edge strength
     # where M[i,j] = strength[i,j];
     M_strength = torch.sparse_coo_tensor(
         indices=torch.stack([edges[:, 0], edges[:, 1]]),
         values=edge_strength,
-        size=(nnodes, nnodes))
+        size=(nnodes, nnodes)).to(device)
     M_strength_rowSum = torch.sparse.sum(M_strength, dim=1)
     # Normalize the transition matrix
-    Q = renorm_neg_cuda(M_strength)
+    Q = renorm_neg(M_strength)
     return Q, M_strength, M_strength_rowSum, strength_grad
 
 
@@ -206,19 +194,21 @@ def generate_Q(edges, nnodes, features, w):
     edge_strength = logistic_edge_strength(features, w)
     # M_strength (n by n) is a matrix containing edge strength
     # where M[i,j] = Strength[i,j];
-    M_strength = csr_matrix((edge_strength, (edges[:,0], edges[:,1])), 
-                            shape=(nnodes, nnodes))
+    M_strength = torch.sparse_coo_tensor(
+        indices=torch.stack([edges[:, 0], edges[:, 1]]),
+        values=edge_strength,
+        size=(nnodes, nnodes))
     Q = renorm_neg(M_strength)
     return Q
 
 # *** This function calculates unweighted Q
 def generate_Q_unweighted(edges, nnodes):
-    M_strength = csr_matrix(([1.]*len(edges), (edges[:,0], edges[:,1])), 
-                            shape=(nnodes, nnodes))
-    # Normalize the transition matrix
+    M_strength = torch.sparse_coo_tensor(
+        indices=torch.stack([edges[:, 0], edges[:, 1]]),
+        values=torch.ones(edges.shape[0]),
+        size=(nnodes, nnodes))
     Q = renorm_neg(M_strength)
     return Q
-
 
 # Calculate the gradient of Q: Q_grad (n by n)
 # with respect to one edge feature weight w[l]
@@ -227,7 +217,7 @@ def generate_Q_unweighted(edges, nnodes):
 #                  -Strength[i,j]*(sum_over_k(dStrength[i,k]/dw[l])))
 #                 / (sum_over_k(strength[i,k]))**2
 # Here strength_grad (e by 1) is with respect to one edge feature weight w[l]
-def Q_gradient_1feature_cuda(edges, nnodes, M_strength, M_strength_rowSum, strength_grad):
+def Q_gradient_1feature(edges, nnodes, M_strength, M_strength_rowSum, strength_grad):
     # M_strength_grad (n by n) is a matrix containing the gradient of edge strength
     # where M_strength_grad[i,j] = strength_grad[i,j];
     M_strength_grad = torch.sparse_coo_tensor(
@@ -240,51 +230,11 @@ def Q_gradient_1feature_cuda(edges, nnodes, M_strength, M_strength_rowSum, stren
     return Q_grad.T.to_sparse_csr()
 
 
-# # This is the allclose comparison for sparse matrices
-# def csr_allclose(a, b, rtol=1e-5, atol = 1e-8):
-#     c = np.abs(a-b) - rtol*np.abs(b)
-#     return c.max() <= atol
-
-def allclose_cuda(a, b, rtol=1e-5, atol = 1e-8):
-    c = abs(a-b) - rtol*abs(b)
-    return (c.max() <= atol).item()
-
-# # This is the allclose comparison for numba.jit
-# @jit(nopython=True)
-# def jit_allclose(a, b, rtol=1e-5, atol = 1e-8):
-#     c = np.abs(a-b) - rtol*np.abs(b)
-#     return c.max() <= atol
-
-# This function takes a normalized transition matrix Q (n by n), 
-# initial state P_init (m by n), and reset probability,
-# then use iteration to find the personalized PageRank at convergence.
-# def iterative_PPR_cuda(Q, P_init, rst_prob):
-#     # Q and P_init are already normalized by row sums
-#     # Takes P_init and a transition matrix to find the PageRank of nodes
-#     P = P_init
-#     rst_prob_P_init = rst_prob*P_init.to_dense()
-#     P_new = (1-rst_prob)*torch.sparse.mm(P,Q).to_dense() + rst_prob_P_init
-#     # P_new =  (1-rst_prob)*cp.dot(P, Q) + rst_prob_P_init
-#     while not(allclose_cuda(P.to_dense(), P_new)):
-#         P = P_new
-#         P_new =  (1-rst_prob)*torch.sparse.mm(P.to_sparse_csr(), Q).to_dense() + rst_prob_P_init
-#     return P_new
-
-# The Hotnet2 implementation of convergence
-# to add if, inv fails
-# def iterative_PPR_conv_cuda(Q, P_init, rst_prob):
-#     # Q and P_init are already normalized by row sums
-#     # Takes P_init and a transition matrix to find the PageRank of nodes
-#     term1 = rst_prob*P_init.to_dense()
-#     term2 = torch.eye(P_init.shape[1])-(1-rst_prob)*Q.to_dense()
-#     term2_inv = torch.linalg.inv(term2)
-#     P_new = torch.mm(term1, term2_inv)
-#     return P_new
 def iterative_PPR_conv_cuda_solve(Q, P_init, rst_prob):
     # Q and P_init are already normalized by row sums
     # Takes P_init and a transition matrix to find the PageRank of nodes
     term1 = rst_prob*P_init.to_dense()
-    term2 = torch.eye(P_init.shape[1])-(1-rst_prob)*(Q.to_dense())
+    term2 = torch.eye(P_init.shape[1]).to(device)-(1-rst_prob)*(Q.to_dense())
     # term2_inv = torch.linalg.inv(term2)
     # P_new = torch.mm(term1, term2_inv)
     P_new = torch.linalg.solve(term2.T, term1.T).T
@@ -318,6 +268,8 @@ def iterative_P_gradient_1feature_conv_cuda(P, Q, Q_grad, rst_prob, term2):
     # P_grad_new = torch.mm(term1, term2_inv)
     P_grad_new = torch.linalg.solve(term2.T,term1.T).T
     return P_grad_new
+
+    
 # def iterative_P_gradient_1feature_conv_cuda(P, Q, Q_grad, rst_prob):
 #     P_grad = torch.zeros(P.shape, dtype=torch.float64)
 #     term1 = (1-rst_prob)*torch.mm(P,Q_grad)
@@ -331,11 +283,11 @@ def iterative_P_gradient_1feature_conv_cuda(P, Q, Q_grad, rst_prob, term2):
 # using multiprocessing.Pool
 def calc_P_grad_1fea_cuda(edges, nnodes, M_strength, M_strength_rowSum, Q, P, rst_prob, term2,
                      strength_grad):
-    Q_grad = Q_gradient_1feature_cuda(edges, nnodes, M_strength.to_dense(), M_strength_rowSum.to_dense(),
+    Q_grad = Q_gradient_1feature(edges, nnodes, M_strength.to_dense(), M_strength_rowSum.to_dense(),
                                  strength_grad)
     # P_grad = iterative_P_gradient_1feature_cuda(P, Q, Q_grad, rst_prob)
     P_grad = iterative_P_gradient_1feature_conv_cuda(P, Q, Q_grad, rst_prob, term2)
-    return P_grad.numpy()
+    return P_grad
 
 
 # This function calculate P_grad with respect to ALL edge feature weights
@@ -347,7 +299,7 @@ def calc_P_grad_cuda(edges, nnodes, M_strength, M_strength_rowSum, Q, P, rst_pro
     term2 = torch.eye(P.shape[1])-(1-rst_prob)*Q.to_dense()
     # term2_inv = torch.linalg.inv(term2)
     strength_grad_split = torch.tensor_split(strength_grad, strength_grad.shape[1], dim=1)
-    P_grad = np.array([calc_P_grad_1fea_cuda(edges, nnodes, M_strength, 
+    P_grad = torch.stack([calc_P_grad_1fea_cuda(edges, nnodes, M_strength, 
                           M_strength_rowSum, Q, P, rst_prob, term2, i) for i in strength_grad_split])
     return P_grad
 
@@ -360,50 +312,114 @@ def calc_P_grad_cuda(edges, nnodes, M_strength, M_strength_rowSum, Q, P, rst_pro
 # where xu = (||(mi/mi-1)(pu-ci)||**2-||pu-cj||**2)
 # where ci is u's true group center (excluding u), and cj is u's nearest neighboring group center
 #@jit(nopython=True)
+# def cost_func_and_grad_WMW(nfeatures, nsamples, ngroups, P, P_grad, C, C_grad, sample2groupid_list, 
+#                            group2nsample_list, b=0.5):
+#     P_dot_PT = np.dot(P, P.T) # m by m
+#     P_dot_CT = np.dot(P, C.T) # m by g
+#     C_dot_CT = np.dot(C, C.T) # g by g
+#     P_dot_PgradT = np.zeros((nfeatures, nsamples, nsamples)) # w by m by m
+#     P_dot_CgradT = np.zeros((nfeatures, nsamples, ngroups)) # w by m by g
+#     C_dot_PgradT = np.zeros((nfeatures, ngroups, nsamples)) # w by g by m
+#     C_dot_CgradT = np.zeros((nfeatures, ngroups, ngroups)) # w by g by g
+#     for l in range(nfeatures):
+#         P_dot_PgradT[l,:,:] = np.dot(P, P_grad[l,:,:].T)
+#         P_dot_CgradT[l,:,:] = np.dot(P, C_grad[l,:,:].T)
+#         C_dot_PgradT[l,:,:] = np.dot(C, P_grad[l,:,:].T)
+#         C_dot_CgradT[l,:,:] = np.dot(C, C_grad[l,:,:].T)
+#     cost = 0.
+#     cost_grad = np.zeros(nfeatures)
+#     accuracy = 0.
+#     M_opponent = np.zeros((ngroups,ngroups))
+#     M_opponent_trunc = np.zeros((ngroups,ngroups))
+#     for u in range(nsamples):
+#         x_u = -2.
+#         i = sample2groupid_list[u]
+#         mi = group2nsample_list[i]
+#         frac_sq = np.square(mi/(mi-1)) # (mi/(mi-1))**2
+#         dist_ui = frac_sq*(P_dot_PT[u,u]-2*P_dot_CT[u,i]+C_dot_CT[i,i])
+#         j_min = i
+#         for j in range(ngroups):
+#             if j != i:
+#                 # xu = ||(mi/mi-1)(pu-ci)||**2-||pu-cj||**2
+#                 x_u_tmp = dist_ui - (P_dot_PT[u,u]-2*P_dot_CT[u,j]+C_dot_CT[j,j])
+#                 if x_u_tmp > x_u:
+#                     x_u = x_u_tmp
+#                     j_min = j
+#         j = j_min
+#         M_opponent[i,j] += 1
+#         if x_u < 0.:
+#             accuracy += 1.
+#         else:
+#             M_opponent_trunc[i,j] += 1
+#         # cost_u = 1 / (1+exp(-xu/b))
+#         cost_u = 1. / (1+np.exp(-x_u/b))
+#         cost += cost_u
+#         # cost_grad_uij = 2/b*cost_u*(1-cost_u) * ((pu-ci).*(pu_grad-ci_grad)*(mi/(mi-1))**2-
+#         #                                          (pu-cj).*(pu_grad-cj_grad))
+#         cost_grad += 2./b*cost_u*(1-cost_u) * ((P_dot_PgradT[:,u,u]
+#                                                 -P_dot_CgradT[:,u,i]
+#                                                 -C_dot_PgradT[:,i,u]
+#                                                 +C_dot_CgradT[:,i,i])*frac_sq
+#                                                -(P_dot_PgradT[:,u,u]
+#                                                  -P_dot_CgradT[:,u,j]
+#                                                  -C_dot_PgradT[:,j,u]
+#                                                  +C_dot_CgradT[:,j,j]))
+#     return cost, cost_grad, accuracy, M_opponent, M_opponent_trunc
 def cost_func_and_grad_WMW(nfeatures, nsamples, ngroups, P, P_grad, C, C_grad, sample2groupid_list, 
                            group2nsample_list, b=0.5):
-    P_dot_PT = np.dot(P, P.T) # m by m
-    P_dot_CT = np.dot(P, C.T) # m by g
-    C_dot_CT = np.dot(C, C.T) # g by g
-    P_dot_PgradT = np.zeros((nfeatures, nsamples, nsamples)) # w by m by m
-    P_dot_CgradT = np.zeros((nfeatures, nsamples, ngroups)) # w by m by g
-    C_dot_PgradT = np.zeros((nfeatures, ngroups, nsamples)) # w by g by m
-    C_dot_CgradT = np.zeros((nfeatures, ngroups, ngroups)) # w by g by g
+    # Matrix multiplications using torch.matmul
+    P_dot_PT = torch.matmul(P, P.t()) 
+    P_dot_CT = torch.matmul(P, C.t()) 
+    C_dot_CT = torch.matmul(C, C.t()) 
+
+    # Initialize gradient tensors using torch.zeros
+    P_dot_PgradT = torch.zeros((nfeatures, nsamples, nsamples)) 
+    P_dot_CgradT = torch.zeros((nfeatures, nsamples, ngroups))
+    C_dot_PgradT = torch.zeros((nfeatures, ngroups, nsamples))
+    C_dot_CgradT = torch.zeros((nfeatures, ngroups, ngroups))
+
+    # Loop for gradient calculations
     for l in range(nfeatures):
-        P_dot_PgradT[l,:,:] = np.dot(P, P_grad[l,:,:].T)
-        P_dot_CgradT[l,:,:] = np.dot(P, C_grad[l,:,:].T)
-        C_dot_PgradT[l,:,:] = np.dot(C, P_grad[l,:,:].T)
-        C_dot_CgradT[l,:,:] = np.dot(C, C_grad[l,:,:].T)
+        P_dot_PgradT[l,:,:] = torch.matmul(P, P_grad[l,:,:].t())
+        P_dot_CgradT[l,:,:] = torch.matmul(P, C_grad[l,:,:].t())
+        C_dot_PgradT[l,:,:] = torch.matmul(C, P_grad[l,:,:].t())
+        C_dot_CgradT[l,:,:] = torch.matmul(C, C_grad[l,:,:].t())
+
+    # Initialize cost, cost_grad, accuracy and M matrices
     cost = 0.
-    cost_grad = np.zeros(nfeatures)
+    cost_grad = torch.zeros(nfeatures)
     accuracy = 0.
-    M_opponent = np.zeros((ngroups,ngroups))
-    M_opponent_trunc = np.zeros((ngroups,ngroups))
+    M_opponent = torch.zeros((ngroups,ngroups))
+    M_opponent_trunc = torch.zeros((ngroups,ngroups))
+
+    # Main loop for cost and gradient computation
     for u in range(nsamples):
         x_u = -2.
         i = sample2groupid_list[u]
         mi = group2nsample_list[i]
-        frac_sq = np.square(mi/(mi-1)) # (mi/(mi-1))**2
+        frac_sq = (mi/(mi-1))**2 
         dist_ui = frac_sq*(P_dot_PT[u,u]-2*P_dot_CT[u,i]+C_dot_CT[i,i])
         j_min = i
+
+        # Inner loop for finding j_min
         for j in range(ngroups):
             if j != i:
-                # xu = ||(mi/mi-1)(pu-ci)||**2-||pu-cj||**2
                 x_u_tmp = dist_ui - (P_dot_PT[u,u]-2*P_dot_CT[u,j]+C_dot_CT[j,j])
                 if x_u_tmp > x_u:
                     x_u = x_u_tmp
                     j_min = j
         j = j_min
+
+        # Update M_opponent and accuracy
         M_opponent[i,j] += 1
         if x_u < 0.:
             accuracy += 1.
         else:
             M_opponent_trunc[i,j] += 1
-        # cost_u = 1 / (1+exp(-xu/b))
-        cost_u = 1. / (1+np.exp(-x_u/b))
+
+        # Calculate cost_u and update cost and cost_grad
+        cost_u = 1. / (1+torch.exp(-x_u/b))
         cost += cost_u
-        # cost_grad_uij = 2/b*cost_u*(1-cost_u) * ((pu-ci).*(pu_grad-ci_grad)*(mi/(mi-1))**2-
-        #                                          (pu-cj).*(pu_grad-cj_grad))
         cost_grad += 2./b*cost_u*(1-cost_u) * ((P_dot_PgradT[:,u,u]
                                                 -P_dot_CgradT[:,u,i]
                                                 -C_dot_PgradT[:,i,u]
@@ -412,7 +428,10 @@ def cost_func_and_grad_WMW(nfeatures, nsamples, ngroups, P, P_grad, C, C_grad, s
                                                  -P_dot_CgradT[:,u,j]
                                                  -C_dot_PgradT[:,j,u]
                                                  +C_dot_CgradT[:,j,j]))
-    return cost, cost_grad, accuracy, M_opponent, M_opponent_trunc
+
+    return cost, cost_grad, accuracy, M_opponent, M_opponent_trunc  
+
+
 
 # This is the WMW cost function (for the validation set)
 def cost_func_WMW(nsamples, ngroups, P, C, sample2groupid_list, b=0.5):
@@ -438,39 +457,78 @@ def cost_func_WMW(nsamples, ngroups, P, C, sample2groupid_list, b=0.5):
     return cost, accuracy
 
 
+# def cost_func_WMW_all(nsamples, ngroups, P, C, sample2groupid_list, b=0.5):
+#     P_dot_CT = np.dot(P, C.T)
+#     C_dot_CT = np.dot(C, C.T)
+#     cost = 0.
+#     accuracy = 0.
+#     #
+#     # Initialize variables for precision and recall calculation
+#     true_positives = 0
+#     false_positives = 0
+#     false_negatives = 0
+#     #
+#     for u in range(nsamples):
+#         x_u = -2.
+#         i = sample2groupid_list[u]
+#         dist_ui = -2*P_dot_CT[u,i] + C_dot_CT[i,i]
+#         for j in range(ngroups):
+#             if j != i:  
+
+#                 x_u_tmp = dist_ui + 2*P_dot_CT[u,j] - C_dot_CT[j,j]
+#                 if x_u_tmp > x_u:
+#                     x_u = x_u_tmp
+#         #
+#         # Update counts for precision and recall
+#         if x_u < 0:
+#             accuracy += 1.
+#             true_positives += 1  # Correct prediction for class i
+#         else:
+#             false_negatives += 1  # Incorrect prediction for class i
+#             false_positives += ngroups - 1  # Incorrect predictions for other classes
+
+#         cost_u = 1. / (1+np.exp(-x_u/b))
+#         cost += cost_u
+#     #
+#     # Calculate precision, recall, and F1-score
+#     precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
+#     recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0
+#     f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+
+#     return cost, accuracy, precision, recall, f1_score
 def cost_func_WMW_all(nsamples, ngroups, P, C, sample2groupid_list, b=0.5):
-    P_dot_CT = np.dot(P, C.T)
-    C_dot_CT = np.dot(C, C.T)
+    P_dot_CT = torch.matmul(P, C.t())
+    C_dot_CT = torch.matmul(C, C.t())
     cost = 0.
     accuracy = 0.
-    #
+
     # Initialize variables for precision and recall calculation
     true_positives = 0
     false_positives = 0
     false_negatives = 0
-    #
+
     for u in range(nsamples):
         x_u = -2.
         i = sample2groupid_list[u]
-        dist_ui = -2*P_dot_CT[u,i] + C_dot_CT[i,i]
+        dist_ui = -2 * P_dot_CT[u, i] + C_dot_CT[i, i]
+
         for j in range(ngroups):
             if j != i:  
-
-                x_u_tmp = dist_ui + 2*P_dot_CT[u,j] - C_dot_CT[j,j]
+                x_u_tmp = dist_ui + 2 * P_dot_CT[u, j] - C_dot_CT[j, j]
                 if x_u_tmp > x_u:
                     x_u = x_u_tmp
-        #
+
         # Update counts for precision and recall
         if x_u < 0:
             accuracy += 1.
-            true_positives += 1  # Correct prediction for class i
+            true_positives += 1 
         else:
-            false_negatives += 1  # Incorrect prediction for class i
-            false_positives += ngroups - 1  # Incorrect predictions for other classes
+            false_negatives += 1 
+            false_positives += ngroups - 1 
 
-        cost_u = 1. / (1+np.exp(-x_u/b))
+        cost_u = 1. / (1 + torch.exp(-x_u / b))
         cost += cost_u
-    #
+
     # Calculate precision, recall, and F1-score
     precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
     recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0
@@ -478,25 +536,47 @@ def cost_func_WMW_all(nsamples, ngroups, P, C, sample2groupid_list, b=0.5):
 
     return cost, accuracy, precision, recall, f1_score
 
-
 # This function calculates the confusion matrix
+# def calc_confusion_matrix(nsamples, ngroups, P, C, sample2groupid_list):
+#     P_dot_CT = np.dot(P, C.T) # m by g
+#     C_dot_CT = np.dot(C, C.T) # g by g
+#     confusion_matrix = np.zeros((ngroups,ngroups))
+#     for u in range(nsamples):
+#         i = sample2groupid_list[u]
+#         j_min = i
+#         dist_min = 2.
+#         for j in range(ngroups):
+#             dist_uj = -2*P_dot_CT[u,j] + C_dot_CT[j,j]
+#             if dist_uj < dist_min:
+#                 j_min = j
+#                 dist_min = dist_uj
+#         j = j_min
+#         confusion_matrix[i,j] += 1
+#     return confusion_matrix
+
 def calc_confusion_matrix(nsamples, ngroups, P, C, sample2groupid_list):
-    P_dot_CT = np.dot(P, C.T) # m by g
-    C_dot_CT = np.dot(C, C.T) # g by g
-    confusion_matrix = np.zeros((ngroups,ngroups))
+    # Matrix multiplications using torch.matmul
+    P_dot_CT = torch.matmul(P, C.t())  # m by g
+    C_dot_CT = torch.matmul(C, C.t())  # g by g
+
+    # Initialize confusion matrix with zeros
+    confusion_matrix = torch.zeros((ngroups, ngroups))
+
     for u in range(nsamples):
         i = sample2groupid_list[u]
         j_min = i
         dist_min = 2.
+
         for j in range(ngroups):
-            dist_uj = -2*P_dot_CT[u,j] + C_dot_CT[j,j]
+            dist_uj = -2 * P_dot_CT[u, j] + C_dot_CT[j, j]
             if dist_uj < dist_min:
                 j_min = j
                 dist_min = dist_uj
-        j = j_min
-        confusion_matrix[i,j] += 1
-    return confusion_matrix
 
+        j = j_min
+        confusion_matrix[i, j] += 1
+
+    return confusion_matrix
 
 ####################################################################################################
 # These are functions used in the building stage of the SRW class
@@ -565,13 +645,32 @@ def update_w_Nesterov_momentum(w, J_grad, learning_rate, v, momentum = 0.9):
 # Adam(Adaptive Moment Estimation)
 # See here for details: 
 # http://cs231n.github.io/neural-networks-3/#ada
+# def update_w_Adam(w, J_grad, learning_rate, m, n, t, eps=1e-8, beta1=0.9, beta2=0.999):
+#     m = beta1*m + (1-beta1)*J_grad #  first moment estimate
+#     m_hat = m / (1-beta1**t) # bias-corrected first moment estimate
+#     n = beta2*n + (1-beta2)*np.square(J_grad) # second moment estimate
+#     n_hat = n / (1-beta2**t) # bias-corrected second moment estimate
+#     w_ = -learning_rate*m_hat / (np.sqrt(n_hat)+eps)
+#     w_ = torch.tensor(w_)
+#     w += w_
+#     return w, m, n
 def update_w_Adam(w, J_grad, learning_rate, m, n, t, eps=1e-8, beta1=0.9, beta2=0.999):
-    m = beta1*m + (1-beta1)*J_grad #  first moment estimate
-    m_hat = m / (1-beta1**t) # bias-corrected first moment estimate
-    n = beta2*n + (1-beta2)*np.square(J_grad) # second moment estimate
-    n_hat = n / (1-beta2**t) # bias-corrected second moment estimate
-    w_ = -learning_rate*m_hat / (np.sqrt(n_hat)+eps)
-    w_ = torch.tensor(w_)
+    # Ensure all inputs are PyTorch tensors, converting if necessary
+    if not isinstance(m, torch.Tensor):
+        m = torch.tensor(m)
+    if not isinstance(n, torch.Tensor):
+        n = torch.tensor(n)
+    # Update first moment estimate
+    m = beta1 * m + (1 - beta1) * J_grad
+    # Bias-corrected first moment estimate
+    m_hat = m / (1 - beta1**t)
+    # Update second moment estimate
+    n = beta2 * n + (1 - beta2) * torch.square(J_grad)  # Use torch.square
+    # Bias-corrected second moment estimate
+    n_hat = n / (1 - beta2**t)
+    # Calculate weight update
+    w_ = -learning_rate * m_hat / (torch.sqrt(n_hat) + eps)  # Use torch.sqrt
+    # Update weights
     w += w_
     return w, m, n
 
@@ -678,36 +777,42 @@ class SRW_solver(object):
     # Initialize edge feature weights from a Gaussian distribution, 
     # with standard deviation w_init_sd
     def init_w(self):
-        self.w = torch.tensor(np.random.normal(scale=self.w_init_sd, size=self.nfeatures))
+        self.w = torch.randn(self.nfeatures).to(device) * self.w_init_sd
         
     
     # This function maps edge feature weights with their names
     def map_w(self):
         if len(self.feature_names) == len(self.w):
-            self.w_map = pd.DataFrame(self.w.cpu().numpy(), index=self.feature_names, columns=['Weight'])
+            self.w_map = pd.DataFrame(self.w, index=self.feature_names, columns=['Weight'])
         else:
-            self.w_map = pd.DataFrame(self.w.cpu().numpy(), columns=['Weight'])
+            self.w_map = pd.DataFrame(self.w, columns=['Weight'])
     
     
     # This function calculate group centroids and their gradients
     def centroid_and_grad(self, P, P_grad, ngroups_local, group2indeces_list_local):
         # Define a matrix C (g by n), which contains the group centroids
-        C = np.zeros((ngroups_local, self.nnodes))
+        C = torch.zeros((ngroups_local, self.nnodes)).to(device)
         # Define a matrix C_grad (w by g by n), which contains the gradient of group centroids
-        C_grad = np.zeros((self.nfeatures, ngroups_local, self.nnodes))
+        C_grad = torch.zeros((self.nfeatures, ngroups_local, self.nnodes)).to(device)
         for i in range(ngroups_local):
-            C[i,:] = P.take(group2indeces_list_local[i], axis=0).mean(axis=0)
-            C_grad[:,i,:] = P_grad.take(group2indeces_list_local[i], axis=1).mean(axis=1)
+            # C[i,:] = P.take(group2indeces_list_local[i], axis=0).mean(axis=0)
+            # C_grad[:,i,:] = P_grad.take(group2indeces_list_local[i], axis=1).mean(axis=1)
+            C[i, :] = P[group2indeces_list_local[i]].mean(dim=0)
+            C_grad[:, i, :] = P_grad[:, group2indeces_list_local[i]].mean(dim=1)
         return C, C_grad
     
     
     # This function calculate group centroids
+    # def centroid(self, P, ngroups_local, group2indeces_list_local):
+    #     C = np.zeros((ngroups_local, self.nnodes))
+    #     for i in range(ngroups_local):
+    #         C[i,:] = P.take(group2indeces_list_local[i], axis=0).mean(axis=0)
+    #     return C
     def centroid(self, P, ngroups_local, group2indeces_list_local):
-        C = np.zeros((ngroups_local, self.nnodes))
+        C = torch.zeros((ngroups_local, self.nnodes))
         for i in range(ngroups_local):
-            C[i,:] = P.take(group2indeces_list_local[i], axis=0).mean(axis=0)
+            C[i, :] = P[group2indeces_list_local[i]].mean(dim=0) 
         return C
-    
     
     # This is the objective function to be minimized, and its gradient
     # ** Objective function (scalar):
@@ -740,12 +845,16 @@ class SRW_solver(object):
         w_nob = w_local[:-1]
         if self.norm_type == 'L2':
             # Calculate the L2 norm squared of edge feature weights
-            norm = np.dot(w_nob, w_nob)
+            # norm = np.dot(w_nob, w_nob)
+            # norm_grad = 2 * w_local
+            norm = torch.dot(w_nob, w_nob)
             norm_grad = 2 * w_local
         elif self.norm_type == 'L1':
             # Calculate the L1 norm of edge feature weights
-            norm = np.sum(np.abs(w_nob))
-            norm_grad = np.sign(w_local)
+            # norm = np.sum(np.abs(w_nob))
+            # norm_grad = np.sign(w_local)
+            norm = torch.sum(torch.abs(w_nob))
+            norm_grad = torch.sign(w_local)
         norm_grad[-1] = 0
 
         J = self.lam*norm + self.cost
@@ -773,14 +882,14 @@ class SRW_solver(object):
     def calculate_J_and_gradient(self, w_local):
         # Generate transition matrix Q (n by n), edge strength matrix (n by n), its row sums (n by 1),
         # and gradient of edge strength (e by w) according to edge features and weights
-        self.Q, M_strength, M_strength_rowSum, strength_grad = strength_Q_and_gradient_cuda(self.edges, 
+        self.Q, M_strength, M_strength_rowSum, strength_grad = strength_Q_and_gradient(self.edges, 
                                                                                        self.nnodes, 
                                                                                        self.features, 
                                                                                        w_local)
         print('finished calculating strength_grad:', time.strftime("%H:%M:%S"))
 
         # Calculate Personalized PageRank (PPR)
-        P = iterative_PPR_conv_cuda_solve(self.Q, renorm_neg_cuda(self.P_init), self.rst_prob)
+        P = iterative_PPR_conv_cuda_solve(self.Q, renorm_neg(self.P_init), self.rst_prob)
 
         print('finished network propagation:', time.strftime("%H:%M:%S"))
 
@@ -788,10 +897,6 @@ class SRW_solver(object):
         P_grad = calc_P_grad_cuda(self.edges, self.nnodes, M_strength, M_strength_rowSum, self.Q, P, 
                                   self.rst_prob, strength_grad, self.ncpus)
         print('finished calculating P_grad using pool:', time.strftime("%H:%M:%S"))
-
-        ### Move all element to cpu
-        P = P.to_dense().numpy()
-        w_local = w_local.numpy()
 
         # Calculate objective function J (scalar), 
         # and its gradient J_grad (length w vector)
@@ -804,7 +909,7 @@ class SRW_solver(object):
     # This wrapper function calculates the cost and accuracy for the validation set
     def calc_cost_and_acc_val(self):
         if self.P_init_val is not None:
-            P_val = iterative_PPR_conv_cuda_solve(self.Q, renorm_neg_cuda(self.P_init_val), self.rst_prob).cpu().numpy()
+            P_val = iterative_PPR_conv_cuda_solve(self.Q, renorm_neg(self.P_init_val), self.rst_prob)
             self.calc_cost_val(P_val)
             
 
@@ -818,7 +923,7 @@ class SRW_solver(object):
         print('\n')
         self.cost_val_list.append(self.cost_val)
         self.cost_list.append(self.cost)
-        self.w_list.append(w_local.cpu().numpy().copy())
+        self.w_list.append(w_local)
         self.accuracy_val_list.append(self.accuracy_val)
         self.accuracy_list.append(self.accuracy)
 
@@ -830,12 +935,12 @@ class SRW_solver(object):
     # using gradient descent functions
     def train_SRW_GD(self, **kwargs):
         # Initialize the velocity of w, used for momentum methods
-        v = np.zeros(self.w.shape)
+        v = torch.zeros(self.w.shape).to(device)
         # Initialize the first and second moment estimate of J_grad, used for Adam
-        m = np.zeros(self.w.shape)
-        n = np.zeros(self.w.shape)
+        m = torch.zeros(self.w.shape).to(device)
+        n = torch.zeros(self.w.shape).to(device)
         # Initialize the momentum schecule PI_mu_t, used for Nadam
-        PI_mu_t = np.array([1.])
+        PI_mu_t = torch.tensor([1.]).to(device)
         
         # t is the iteration counter
         t = 0
@@ -849,7 +954,7 @@ class SRW_solver(object):
         # Update J and J_grad for the first time
         J_new, J_grad = self.calc_J_Jgrad_wrapper(self.w, t)
 
-        while (not np.allclose(J, J_new)) and (t < self.maxit):
+        while (not allclose(J, J_new)) and (t < self.maxit):
             t += 1
             J = J_new
             # Update w
@@ -871,7 +976,7 @@ class SRW_solver(object):
     def generate_Q_and_P_fin(self):
         print("Here! generate_Q_and_P_fin")
         self.Q_fin = generate_Q(self.edges, self.nnodes, self.features, self.w)
-        self.P_fin = iterative_PPR(self.Q_fin.toarray(), renorm_neg(self.P_init).toarray(), 
+        self.P_fin = iterative_PPR_conv_cuda_solve(self.Q_fin.toarray(), renorm_neg(self.P_init).toarray(), 
                                    self.rst_prob)
         if len(self.node_names) == self.nnodes:
             self.Q_fin_df = pd.DataFrame(self.Q_fin.toarray(), index=self.node_names, 
@@ -879,6 +984,3 @@ class SRW_solver(object):
             if len(self.sample_names) == self.nsamples:
                 self.P_fin_df = pd.DataFrame(self.P_fin, index=self.sample_names, 
                                              columns=self.node_names)
-
-        
-        
