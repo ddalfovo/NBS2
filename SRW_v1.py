@@ -976,10 +976,10 @@ class SRW_solver(object):
     def generate_Q_and_P_fin(self):
         print("Here! generate_Q_and_P_fin")
         self.Q_fin = generate_Q(self.edges, self.nnodes, self.features, self.w)
-        self.P_fin = iterative_PPR_conv_cuda_solve(self.Q_fin.toarray(), renorm_neg(self.P_init).toarray(), 
+        self.P_fin = iterative_PPR_conv_cuda_solve(self.Q_fin, renorm_neg(self.P_init), 
                                    self.rst_prob)
         if len(self.node_names) == self.nnodes:
-            self.Q_fin_df = pd.DataFrame(self.Q_fin.toarray(), index=self.node_names, 
+            self.Q_fin_df = pd.DataFrame(self.Q_fin, index=self.node_names, 
                                          columns=self.node_names)
             if len(self.sample_names) == self.nsamples:
                 self.P_fin_df = pd.DataFrame(self.P_fin, index=self.sample_names, 

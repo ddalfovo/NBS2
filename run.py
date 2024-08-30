@@ -96,7 +96,7 @@ SRW_obj = SRW.SRW_solver(edges, features, nnodes, P_init_train, rst_prob_fix, gr
                          sample_names=sample_names_train, node_names=node_names, loss='WMW', 
                          norm_type='L1', learning_rate=0.1, update_w_func='Adam', 
                          P_init_val=P_init_val, group_labels_val=group_labels_val, ncpus=10, 
-                         maxit=2, early_stop=2, WMW_b=beta_loss_fix)
+                         maxit=100, early_stop=50, WMW_b=beta_loss_fix)
 SRW_obj.train_SRW_GD()
 
 
